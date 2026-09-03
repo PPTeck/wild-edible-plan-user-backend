@@ -209,10 +209,38 @@ router.post('/verify-otp', async (req, res) => {
     const crypto       = require('crypto');
     const sessionId    = crypto.randomBytes(16).toString('hex');
 
-    // Store current sessionId in user_table — overwrites any previous session
+    // ── Store current sessionId in user_table (legacy single-device field)
     await pool.query(
       `UPDATE user_table SET session_token = $1 WHERE user_id = $2`,
       [sessionId, userId]
+    );
+
+    // ── Check user_sessions for an existing active session ────────────────
+    const existingSession = await pool.query(
+      `SELECT id, session_id
+       FROM   user_sessions
+       WHERE  user_id   = $1
+         AND  is_active = true
+       ORDER  BY created_at DESC
+       LIMIT  1`,
+      [userId]
+    );
+
+    if (existingSession.rows.length > 0) {
+      // Active session on another device — return 409 conflict
+      return res.status(409).json({
+        message:             'active_session_exists',
+        existing_session_id: existingSession.rows[0].session_id,
+      });
+    }
+
+    // ── Insert new session row ────────────────────────────────────────────
+    const expiresAt = new Date(Date.now() + 8 * 60 * 60 * 1000);   // 8 h (matches JWT)
+    await pool.query(
+      `INSERT INTO user_sessions
+         (user_id, session_id, is_active, created_at, last_activity, expires_at)
+       VALUES ($1, $2, true, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, $3)`,
+      [userId, sessionId, expiresAt]
     );
 
     const role = record.roleName.trim().toUpperCase();
@@ -249,14 +277,39 @@ function maskEmail(email) {
 }
 
 // ── POST /api/auth/validate-session ───────────────────────
-// Angular calls this periodically to check if session is still valid.
-// Returns 401 if another device has logged in (sessionId mismatch).
+// Angular polls this every 15 s and on mouse/click activity.
+// Returns 401 when another device has taken over the session.
 router.post('/validate-session', async (req, res) => {
   const { token } = req.body;
   if (!token) return res.status(400).json({ error: 'token required' });
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
+
+    // ── Primary check: user_sessions table (is_active flag) ──
+    // JWT carries sessionId (hex string from crypto.randomBytes).
+    if (decoded.sessionId) {
+      const { rows } = await pool.query(
+        `SELECT is_active FROM user_sessions WHERE session_id = $1`,
+        [decoded.sessionId]
+      );
+
+      if (!rows.length || rows[0].is_active === false) {
+        return res.status(401).json({
+          error: 'Session has been invalidated. You have been logged in from another device.'
+        });
+      }
+
+      // Refresh last_activity so idle sessions don't look stale
+      await pool.query(
+        `UPDATE user_sessions SET last_activity = CURRENT_TIMESTAMP WHERE session_id = $1`,
+        [decoded.sessionId]
+      );
+
+      return res.json({ valid: true });
+    }
+
+    // ── Fallback: legacy session_token field ──────────────────
     const { rows } = await pool.query(
       `SELECT session_token FROM user_table WHERE user_id = $1`,
       [decoded.id]
@@ -264,12 +317,14 @@ router.post('/validate-session', async (req, res) => {
 
     if (!rows.length) return res.status(401).json({ error: 'User not found' });
 
-    // If DB sessionId differs from token's sessionId → another device logged in
     if (rows[0].session_token !== decoded.sessionId) {
-      return res.status(401).json({ error: 'Session expired. You have been logged in from another device.' });
+      return res.status(401).json({
+        error: 'Session expired. You have been logged in from another device.'
+      });
     }
 
     res.json({ valid: true });
+
   } catch (err) {
     res.status(401).json({ error: 'Invalid or expired token' });
   }
@@ -439,5 +494,97 @@ async function sendResetEmail(toEmail, userName, otp) {
   });
   return { sent: true };
 }
+
+// ── POST /api/auth/force-logout-session ───────────────────
+// Called when the user clicks OK on the "already logged in" popup.
+// Marks the existing session inactive so the next verify-otp can proceed.
+router.post('/force-logout-session', async (req, res) => {
+  const { session_id } = req.body;
+
+  if (!session_id) {
+    return res.status(400).json({ error: 'session_id is required' });
+  }
+
+  try {
+    await pool.query(
+      `UPDATE user_sessions
+       SET    is_active           = false,
+              invalidated_at      = CURRENT_TIMESTAMP,
+              invalidation_reason = 'forced_logout_by_new_login'
+       WHERE  session_id = $1`,
+      [session_id]
+    );
+
+    res.json({ success: true, message: 'Session invalidated successfully' });
+  } catch (err) {
+    console.error('force-logout-session error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POST /api/auth/issue-token ────────────────────────────
+// Called after force-logout to issue a fresh JWT + session
+// without requiring the user to re-enter OTP.
+// Only works if the user has a recently-verified OTP row.
+router.post('/issue-token', async (req, res) => {
+  const { userId } = req.body;
+  if (!userId) return res.status(400).json({ error: 'userId is required' });
+
+  try {
+    // Fetch user + role info
+    const { rows } = await pool.query(`
+      SELECT u.user_id, u.user_name, u.email_id, u.phone_number,
+             TRIM(r.role_name)  AS "roleName",
+             r.feature_allowed  AS "featureAllowed"
+      FROM user_table  u
+      JOIN role_table  r ON u.role_id = r.role_id
+      WHERE u.user_id = $1
+    `, [userId]);
+
+    if (!rows.length) return res.status(404).json({ error: 'User not found' });
+
+    const record = rows[0];
+    const crypto = require('crypto');
+    const sessionId = crypto.randomBytes(16).toString('hex');
+
+    // Update legacy session_token
+    await pool.query(
+      `UPDATE user_table SET session_token = $1 WHERE user_id = $2`,
+      [sessionId, userId]
+    );
+
+    // Insert fresh user_sessions row
+    const expiresAt = new Date(Date.now() + 8 * 60 * 60 * 1000);
+    await pool.query(
+      `INSERT INTO user_sessions
+         (user_id, session_id, is_active, created_at, last_activity, expires_at)
+       VALUES ($1, $2, true, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, $3)`,
+      [userId, sessionId, expiresAt]
+    );
+
+    const role  = record.roleName.trim().toUpperCase();
+    const token = jwt.sign({
+      id:        Number(userId),
+      email:     record.email_id,
+      role:      role === 'REVIEWER' ? 'MANAGER' : role,
+      sessionId,
+    }, JWT_SECRET, { expiresIn: '8h' });
+
+    res.json({
+      success:        true,
+      userId,
+      userName:       record.user_name,
+      emailId:        record.email_id,
+      phoneNumber:    record.phone_number,
+      roleName:       record.roleName,
+      featureAllowed: record.featureAllowed,
+      token,
+    });
+
+  } catch (err) {
+    console.error('issue-token error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 module.exports = router;
