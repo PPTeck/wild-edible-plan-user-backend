@@ -38,5 +38,5 @@ app.get('/api/health', (_req, res) => res.json({ status: 'ok', ts: new Date() })
 app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
 
 app.listen(PORT, () =>
-  console.log(`✅  Plant API Node.js server running on http://192.168.29.51:${PORT}`)
+  console.log(`✅  Plant API Node.js server running on http://192.168.29.216:${PORT}`)
 );
