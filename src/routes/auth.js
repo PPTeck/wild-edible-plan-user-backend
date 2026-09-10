@@ -16,6 +16,9 @@ const nodemailer = require('nodemailer');
 const pool       = require('../db');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'local-development-jwt-secret';
+const MAX_LOGIN_ATTEMPTS = 3;
+const LOCKOUT_HOURS = 1;
+const LOCKOUT_WINDOW = `${LOCKOUT_HOURS} hours`;
 
 // ── AWS SES SMTP transporter ───────────────────────────────
 const transporter = nodemailer.createTransport({
@@ -93,6 +96,47 @@ router.post('/login', async (req, res) => {
   }
 
   try {
+    const normalizedEmail = emailId.trim().toLowerCase();
+    const isAdminLogin = roleName.trim().toLowerCase() === 'admin';
+
+    // Lock the account after three failed password attempts in one hour.
+    const attemptsResult = !isAdminLogin && await pool.query(`
+      SELECT COUNT(*) AS count
+      FROM login_attempts
+      WHERE email = $1
+        AND success = FALSE
+        AND attempted_at > NOW() - $2::INTERVAL
+    `, [normalizedEmail, LOCKOUT_WINDOW]);
+
+    if (!isAdminLogin && Number(attemptsResult.rows[0].count) >= MAX_LOGIN_ATTEMPTS) {
+      const oldestResult = await pool.query(`
+        SELECT attempted_at
+        FROM login_attempts
+        WHERE email = $1
+          AND success = FALSE
+          AND attempted_at > NOW() - $2::INTERVAL
+        ORDER BY attempted_at ASC
+        LIMIT 1
+      `, [normalizedEmail, LOCKOUT_WINDOW]);
+
+      const lockedSince = new Date(oldestResult.rows[0].attempted_at);
+      const lockedUntil = new Date(lockedSince.getTime() + LOCKOUT_HOURS * 60 * 60 * 1000);
+      const lockedUserResult = await pool.query(`
+        SELECT user_name
+        FROM user_table u
+        JOIN role_table r ON u.role_id = r.role_id
+        WHERE LOWER(u.email_id) = $1 AND TRIM(r.role_name) = $2
+        LIMIT 1
+      `, [normalizedEmail, roleName]);
+
+      return res.status(429).json({
+        error: 'account_locked',
+        userName: lockedUserResult.rows[0]?.user_name ?? normalizedEmail,
+        lockedUntil: lockedUntil.toISOString(),
+        minutesLeft: Math.max(1, Math.ceil((lockedUntil.getTime() - Date.now()) / 60000)),
+      });
+    }
+
     // Find user by email + role
     const { rows } = await pool.query(`
       SELECT u.user_id, u.user_name, u.phone_number, u.email_id,
@@ -103,9 +147,13 @@ router.post('/login', async (req, res) => {
       JOIN role_table r ON u.role_id = r.role_id
       WHERE LOWER(u.email_id) = LOWER($1)
         AND TRIM(r.role_name) = $2
-    `, [emailId.trim(), roleName]);
+    `, [normalizedEmail, roleName]);
 
     if (!rows.length) {
+      if (!isAdminLogin) await pool.query(
+        `INSERT INTO login_attempts (email, success, ip_address) VALUES ($1, FALSE, $2)`,
+        [normalizedEmail, req.ip ?? null]
+      );
       return res.status(401).json({ error: 'Invalid email or role. Please check and try again.' });
     }
 
@@ -117,8 +165,50 @@ router.post('/login', async (req, res) => {
       : await bcrypt.compare(password, user.password_hash);
 
     if (!isValid) {
+      if (!isAdminLogin) await pool.query(
+        `INSERT INTO login_attempts (email, success, ip_address) VALUES ($1, FALSE, $2)`,
+        [normalizedEmail, req.ip ?? null]
+      );
+
+      const failedAttempts = !isAdminLogin && await pool.query(`
+        SELECT COUNT(*) AS count
+        FROM login_attempts
+        WHERE email = $1
+          AND success = FALSE
+          AND attempted_at > NOW() - $2::INTERVAL
+      `, [normalizedEmail, LOCKOUT_WINDOW]);
+
+      const attempts = !isAdminLogin && Number(failedAttempts.rows[0].count);
+      if (!isAdminLogin && attempts >= MAX_LOGIN_ATTEMPTS) {
+        const oldestResult = await pool.query(`
+          SELECT attempted_at
+          FROM login_attempts
+          WHERE email = $1
+            AND success = FALSE
+            AND attempted_at > NOW() - $2::INTERVAL
+          ORDER BY attempted_at ASC
+          LIMIT 1
+        `, [normalizedEmail, LOCKOUT_WINDOW]);
+        const lockedUntil = new Date(
+          new Date(oldestResult.rows[0].attempted_at).getTime() + LOCKOUT_HOURS * 60 * 60 * 1000
+        );
+
+        return res.status(429).json({
+          error: 'account_locked',
+          userName: user.user_name,
+          lockedUntil: lockedUntil.toISOString(),
+          minutesLeft: Math.max(1, Math.ceil((lockedUntil.getTime() - Date.now()) / 60000)),
+        });
+      }
+
       return res.status(401).json({ error: 'Incorrect password' });
     }
+
+    // A valid password starts a fresh failure window for this account.
+    if (!isAdminLogin) await pool.query(
+      `DELETE FROM login_attempts WHERE email = $1 AND success = FALSE`,
+      [normalizedEmail]
+    );
 
     // Generate OTP (expires in 5 minutes)
     const otp       = generateOTP();
@@ -163,6 +253,8 @@ router.post('/login', async (req, res) => {
 // ── POST /api/auth/verify-otp ──────────────────────────────
 router.post('/verify-otp', async (req, res) => {
   const { userId, otpCode } = req.body;
+
+  console.log('verify-otp request:', { userId, otpCode });
 
   if (!userId || !otpCode) {
     return res.status(400).json({ error: 'userId and otpCode are required' });
