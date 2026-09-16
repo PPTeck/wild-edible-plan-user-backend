@@ -450,6 +450,7 @@ router.post(
           u.phone_number,
           u.email_id,
           u.password_hash,
+          u.is_active,
           TRIM(r.role_name) AS "roleName",
           r.feature_allowed AS "featureAllowed"
 
@@ -497,6 +498,21 @@ router.post(
 
 
       const user = rows[0];
+
+
+      /* ------------------------------------------------------------
+         CHECK ACCOUNT STATUS
+      ------------------------------------------------------------ */
+
+      if (user.is_active !== true) {
+
+        return res.status(403).json({
+          error: 'account_deactivated',
+          message:
+            'Your account has been deactivated. You cannot log in at this time. Please contact the administrator.'
+        });
+
+      }
 
 
       /* ------------------------------------------------------------
