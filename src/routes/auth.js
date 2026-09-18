@@ -786,395 +786,734 @@ router.post(
    POST /api/auth/verify-otp
 ================================================================ */
 
-router.post(
-  '/verify-otp',
-  async (req, res) => {
+router.post('/verify-otp', async (req, res) => {
 
-    const {
-      userId,
-      otpCode
-    } = req.body;
+  const { userId, otpCode } = req.body;
+
+  console.log('========================================');
+  console.log('VERIFY OTP REQUEST');
+  console.log('USER ID:', userId);
+  console.log('OTP:', otpCode);
+  console.log('========================================');
+
+
+  if (!userId || !otpCode) {
+    return res.status(400).json({
+      error: 'userId and otpCode are required'
+    });
+  }
+
+
+  try {
+
+    // ==========================================================
+    // 1. FIND PENDING OTP
+    // ==========================================================
+
+    const { rows } = await pool.query(`
+      SELECT
+        o.otp_id,
+        o.otp_code,
+        o.expires_at,
+
+        u.user_name,
+        u.email_id,
+        u.phone_number,
+
+        TRIM(r.role_name) AS "roleName",
+        r.feature_allowed AS "featureAllowed"
+
+      FROM otp_table o
+
+      JOIN user_table u
+        ON o.user_id = u.user_id
+
+      JOIN role_table r
+        ON u.role_id = r.role_id
+
+      WHERE o.user_id = $1
+        AND o.verified = FALSE
+
+      ORDER BY o.created_at DESC
+
+      LIMIT 1
+    `, [userId]);
 
 
     console.log(
-      'verify-otp request:',
-      {
-        userId,
-        otpCode
-      }
+      'PENDING OTP ROWS:',
+      rows.length
     );
 
 
-    if (
-      !userId ||
-      !otpCode
-    ) {
+    if (!rows.length) {
 
-      return res.status(400).json({
+      return res.status(401).json({
         error:
-          'userId and otpCode are required'
+          'No pending OTP found. Please login again.'
       });
-
     }
 
 
-    try {
-
-      /* ------------------------------------------------------------
-         FIND OTP + USER
-      ------------------------------------------------------------ */
-
-      const {
-        rows
-      } = await pool.query(
-        `
-        SELECT
-          o.otp_id,
-          o.otp_code,
-          o.expires_at,
-
-          u.user_name,
-          u.email_id,
-          u.phone_number,
-
-          TRIM(r.role_name) AS "roleName",
-          r.feature_allowed AS "featureAllowed"
-
-        FROM otp_table o
-
-        JOIN user_table u
-          ON o.user_id = u.user_id
-
-        JOIN role_table r
-          ON u.role_id = r.role_id
-
-        WHERE o.user_id = $1
-          AND o.verified = FALSE
-
-        ORDER BY o.created_at DESC
-
-        LIMIT 1
-        `,
-        [
-          userId
-        ]
-      );
+    const record = rows[0];
 
 
-      if (!rows.length) {
+    // ==========================================================
+    // 2. CHECK OTP EXPIRY
+    // ==========================================================
 
-        return res.status(401).json({
-          error:
-            'No pending OTP found. Please login again.'
-        });
+    if (
+      new Date() >
+      new Date(record.expires_at)
+    ) {
 
-      }
-
-
-      const record =
-        rows[0];
-
-
-      /* ------------------------------------------------------------
-         CHECK OTP EXPIRY
-      ------------------------------------------------------------ */
-
-      if (
-        new Date() >
-        new Date(
-          record.expires_at
-        )
-      ) {
-
-        return res.status(401).json({
-          error:
-            'OTP expired (5 min). Please login again.'
-        });
-
-      }
+      return res.status(401).json({
+        error:
+          'OTP expired (5 min). Please login again.'
+      });
+    }
 
 
-      /* ------------------------------------------------------------
-         CHECK OTP CODE
-      ------------------------------------------------------------ */
+    // ==========================================================
+    // 3. CHECK OTP CODE
+    // ==========================================================
 
-      if (
-        record.otp_code !==
-        otpCode.trim()
-      ) {
+    if (
+      record.otp_code !== otpCode.trim()
+    ) {
 
-        return res.status(401).json({
-          error:
-            'Invalid OTP code. Please try again.'
-        });
-
-      }
+      return res.status(401).json({
+        error:
+          'Invalid OTP code. Please try again.'
+      });
+    }
 
 
-      /* ------------------------------------------------------------
-         MARK OTP VERIFIED
-      ------------------------------------------------------------ */
-
-      await pool.query(
-        `
-        UPDATE otp_table
-        SET verified = TRUE
-        WHERE otp_id = $1
-        `,
-        [
-          record.otp_id
-        ]
-      );
+    console.log(
+      'OTP CODE VALID'
+    );
 
 
-      /* ------------------------------------------------------------
-         GENERATE UNIQUE SESSION ID
-      ------------------------------------------------------------ */
+    // ==========================================================
+    // 4. CHECK EXISTING ACTIVE SESSION
+    // ==========================================================
 
-      const sessionId =
-        crypto
-          .randomBytes(16)
-          .toString('hex');
+    const existingSession = await pool.query(`
+      SELECT
+        id,
+        session_id,
+        expires_at
 
+      FROM user_sessions
 
-      /* ------------------------------------------------------------
-         CHECK EXISTING ACTIVE SESSION
-         
-         IMPORTANT:
-         This check happens BEFORE updating user_table.session_token.
-      ------------------------------------------------------------ */
+      WHERE user_id = $1
+        AND is_active = TRUE
 
-      const existingSession =
-        await pool.query(
-          `
-          SELECT
-            id,
-            session_id
+      ORDER BY created_at DESC
 
-          FROM user_sessions
-
-          WHERE user_id = $1
-            AND is_active = TRUE
-
-          ORDER BY created_at DESC
-
-          LIMIT 1
-          `,
-          [
-            userId
-          ]
-        );
+      LIMIT 1
+    `, [userId]);
 
 
-      if (
-        existingSession.rows.length > 0
-      ) {
-
-        console.log(
-          'Active session already exists:',
-          existingSession.rows[0].session_id
-        );
+    console.log(
+      'ACTIVE SESSION COUNT:',
+      existingSession.rows.length
+    );
 
 
-        return res.status(409).json({
+    // ==========================================================
+    // ACTIVE SESSION EXISTS
+    // ==========================================================
 
-          message:
-            'active_session_exists',
-
-          existing_session_id:
-            existingSession
-              .rows[0]
-              .session_id
-
-        });
-
-      }
-
-
-      /* ------------------------------------------------------------
-         UPDATE LEGACY SESSION TOKEN
-      ------------------------------------------------------------ */
-
-      await pool.query(
-        `
-        UPDATE user_table
-        SET session_token = $1
-        WHERE user_id = $2
-        `,
-        [
-          sessionId,
-          userId
-        ]
-      );
-
-
-      /* ------------------------------------------------------------
-         GET DEVICE INFORMATION
-      ------------------------------------------------------------ */
-
-      const {
-        deviceType,
-        ipAddress,
-        location
-      } = getDeviceInfo(req);
-
+    if (
+      existingSession.rows.length > 0
+    ) {
 
       console.log(
-        'New login device information:',
+        'ACTIVE SESSION ALREADY EXISTS'
+      );
+
+
+      return res.status(409).json({
+
+        message:
+          'active_session_exists',
+
+        existing_session_id:
+          existingSession.rows[0].session_id
+      });
+    }
+
+
+    // ==========================================================
+    // 5. NOW MARK OTP AS VERIFIED
+    // ==========================================================
+
+    await pool.query(`
+      UPDATE otp_table
+
+      SET verified = TRUE
+
+      WHERE otp_id = $1
+    `, [record.otp_id]);
+
+
+    console.log(
+      'OTP MARKED VERIFIED'
+    );
+
+
+    // ==========================================================
+    // 6. GENERATE SESSION ID
+    // ==========================================================
+
+    const crypto = require('crypto');
+
+    const sessionId =
+      crypto.randomBytes(16).toString('hex');
+
+
+    console.log(
+      'SESSION ID GENERATED:',
+      sessionId
+    );
+
+
+    // ==========================================================
+    // 7. UPDATE LEGACY SESSION TOKEN
+    // ==========================================================
+
+    await pool.query(`
+      UPDATE user_table
+
+      SET session_token = $1
+
+      WHERE user_id = $2
+    `, [
+      sessionId,
+      userId
+    ]);
+
+
+    // ==========================================================
+    // 8. CREATE NEW SESSION
+    // ==========================================================
+
+    const expiresAt =
+      new Date(
+        Date.now() +
+        8 * 60 * 60 * 1000
+      );
+
+
+    await pool.query(`
+      INSERT INTO user_sessions
+      (
+        user_id,
+        session_id,
+        is_active,
+        created_at,
+        last_activity,
+        expires_at
+      )
+
+      VALUES
+      (
+        $1,
+        $2,
+        TRUE,
+        CURRENT_TIMESTAMP,
+        CURRENT_TIMESTAMP,
+        $3
+      )
+    `, [
+      userId,
+      sessionId,
+      expiresAt
+    ]);
+
+
+    console.log(
+      'NEW SESSION CREATED'
+    );
+
+
+    // ==========================================================
+    // 9. GENERATE JWT
+    // ==========================================================
+
+    const role =
+      record.roleName
+        .trim()
+        .toUpperCase();
+
+
+    const token =
+      jwt.sign(
+
         {
-          deviceType,
-          ipAddress,
-          location
+          id:
+            Number(userId),
+
+          email:
+            record.email_id,
+
+          role:
+            role === 'REVIEWER'
+              ? 'MANAGER'
+              : role,
+
+          sessionId:
+            sessionId
+        },
+
+        JWT_SECRET,
+
+        {
+          expiresIn: '8h'
         }
       );
 
 
-      /* ------------------------------------------------------------
-         SESSION EXPIRY
-         
-         8 hours — same as JWT expiry.
-      ------------------------------------------------------------ */
-
-      const sessionExpiresAt =
-        new Date(
-          Date.now() +
-          8 * 60 * 60 * 1000
-        );
+    console.log(
+      'JWT GENERATED'
+    );
 
 
-      /* ------------------------------------------------------------
-         INSERT USER SESSION
-      ------------------------------------------------------------ */
+    // ==========================================================
+    // 10. SUCCESS RESPONSE
+    // ==========================================================
 
-      await pool.query(
-        `
-        INSERT INTO user_sessions
-        (
-          user_id,
-          session_id,
-          is_active,
-          created_at,
-          last_activity,
-          expires_at,
-          device_type,
-          location,
-          ip_address
-        )
+    return res.json({
 
-        VALUES
-        (
-          $1,
-          $2,
-          TRUE,
-          CURRENT_TIMESTAMP,
-          CURRENT_TIMESTAMP,
-          $3,
-          $4,
-          $5,
-          $6
-        )
-        `,
-        [
-          userId,
-          sessionId,
-          sessionExpiresAt,
-          deviceType,
-          location,
-          ipAddress
-        ]
-      );
+      success: true,
 
+      userId:
+        Number(userId),
 
-      /* ------------------------------------------------------------
-         CREATE JWT
-         
-         IMPORTANT:
-         Use session_id, NOT sessionId.
-         
-         authMiddleware reads:
-         
-             decoded.session_id
-      ------------------------------------------------------------ */
+      userName:
+        record.user_name,
 
-      const role =
-        record.roleName
-          .trim()
-          .toUpperCase();
+      emailId:
+        record.email_id,
 
+      phoneNumber:
+        record.phone_number,
 
-      const token =
-        jwt.sign(
-          {
-            id:
-              Number(userId),
+      roleName:
+        record.roleName,
 
-            email:
-              record.email_id,
+      featureAllowed:
+        record.featureAllowed,
 
-            role:
-              role === 'REVIEWER'
-                ? 'MANAGER'
-                : role,
-
-            session_id:
-              sessionId
-
-          },
-
-          JWT_SECRET,
-
-          {
-            expiresIn: '8h'
-          }
-        );
-
-
-      /* ------------------------------------------------------------
-         RESPONSE
-      ------------------------------------------------------------ */
-
-      res.json({
-
-        success: true,
-
-        userId,
-
-        userName:
-          record.user_name,
-
-        emailId:
-          record.email_id,
-
-        phoneNumber:
-          record.phone_number,
-
-        roleName:
-          record.roleName,
-
-        featureAllowed:
-          record.featureAllowed,
-
+      token:
         token
+    });
 
-      });
 
+  } catch (err) {
 
-    } catch (err) {
+    console.error(
+      'OTP verify error:',
+      err
+    );
 
-      console.error(
-        'OTP verify error:',
+    return res.status(500).json({
+      error:
         err.message
-      );
-
-      res.status(500).json({
-        error:
-          err.message
-      });
-
-    }
-
+    });
   }
-);
+});
+
+// router.post(
+//   '/verify-otp',
+//   async (req, res) => {
+
+//     const {
+//       userId,
+//       otpCode
+//     } = req.body;
+
+
+//     console.log(
+//       'verify-otp request:',
+//       {
+//         userId,
+//         otpCode
+//       }
+//     );
+
+
+//     if (
+//       !userId ||
+//       !otpCode
+//     ) {
+
+//       return res.status(400).json({
+//         error:
+//           'userId and otpCode are required'
+//       });
+
+//     }
+
+
+//     try {
+
+//       /* ------------------------------------------------------------
+//          FIND OTP + USER
+//       ------------------------------------------------------------ */
+
+//       const {
+//         rows
+//       } = await pool.query(
+//         `
+//         SELECT
+//           o.otp_id,
+//           o.otp_code,
+//           o.expires_at,
+
+//           u.user_name,
+//           u.email_id,
+//           u.phone_number,
+
+//           TRIM(r.role_name) AS "roleName",
+//           r.feature_allowed AS "featureAllowed"
+
+//         FROM otp_table o
+
+//         JOIN user_table u
+//           ON o.user_id = u.user_id
+
+//         JOIN role_table r
+//           ON u.role_id = r.role_id
+
+//         WHERE o.user_id = $1
+//           AND o.verified = FALSE
+
+//         ORDER BY o.created_at DESC
+
+//         LIMIT 1
+//         `,
+//         [
+//           userId
+//         ]
+//       );
+
+
+//       if (!rows.length) {
+
+//         return res.status(401).json({
+//           error:
+//             'No pending OTP found. Please login again.'
+//         });
+
+//       }
+
+
+//       const record =
+//         rows[0];
+
+
+//       /* ------------------------------------------------------------
+//          CHECK OTP EXPIRY
+//       ------------------------------------------------------------ */
+
+//       if (
+//         new Date() >
+//         new Date(
+//           record.expires_at
+//         )
+//       ) {
+
+//         return res.status(401).json({
+//           error:
+//             'OTP expired (5 min). Please login again.'
+//         });
+
+//       }
+
+
+//       /* ------------------------------------------------------------
+//          CHECK OTP CODE
+//       ------------------------------------------------------------ */
+
+//       if (
+//         record.otp_code !==
+//         otpCode.trim()
+//       ) {
+
+//         return res.status(401).json({
+//           error:
+//             'Invalid OTP code. Please try again.'
+//         });
+
+//       }
+
+
+//       /* ------------------------------------------------------------
+//          MARK OTP VERIFIED
+//       ------------------------------------------------------------ */
+
+//       await pool.query(
+//         `
+//         UPDATE otp_table
+//         SET verified = TRUE
+//         WHERE otp_id = $1
+//         `,
+//         [
+//           record.otp_id
+//         ]
+//       );
+
+
+//       /* ------------------------------------------------------------
+//          GENERATE UNIQUE SESSION ID
+//       ------------------------------------------------------------ */
+
+//       const sessionId =
+//         crypto
+//           .randomBytes(16)
+//           .toString('hex');
+
+
+//       /* ------------------------------------------------------------
+//          CHECK EXISTING ACTIVE SESSION
+         
+//          IMPORTANT:
+//          This check happens BEFORE updating user_table.session_token.
+//       ------------------------------------------------------------ */
+
+//       const existingSession =
+//         await pool.query(
+//           `
+//           SELECT
+//             id,
+//             session_id
+
+//           FROM user_sessions
+
+//           WHERE user_id = $1
+//             AND is_active = TRUE
+
+//           ORDER BY created_at DESC
+
+//           LIMIT 1
+//           `,
+//           [
+//             userId
+//           ]
+//         );
+
+
+//       if (
+//         existingSession.rows.length > 0
+//       ) {
+
+//         console.log(
+//           'Active session already exists:',
+//           existingSession.rows[0].session_id
+//         );
+
+
+//         return res.status(409).json({
+
+//           message:
+//             'active_session_exists',
+
+//           existing_session_id:
+//             existingSession
+//               .rows[0]
+//               .session_id
+
+//         });
+
+//       }
+
+
+//       /* ------------------------------------------------------------
+//          UPDATE LEGACY SESSION TOKEN
+//       ------------------------------------------------------------ */
+
+//       await pool.query(
+//         `
+//         UPDATE user_table
+//         SET session_token = $1
+//         WHERE user_id = $2
+//         `,
+//         [
+//           sessionId,
+//           userId
+//         ]
+//       );
+
+
+//       /* ------------------------------------------------------------
+//          GET DEVICE INFORMATION
+//       ------------------------------------------------------------ */
+
+//       const {
+//         deviceType,
+//         ipAddress,
+//         location
+//       } = getDeviceInfo(req);
+
+
+//       console.log(
+//         'New login device information:',
+//         {
+//           deviceType,
+//           ipAddress,
+//           location
+//         }
+//       );
+
+
+//       /* ------------------------------------------------------------
+//          SESSION EXPIRY
+         
+//          8 hours — same as JWT expiry.
+//       ------------------------------------------------------------ */
+
+//       const sessionExpiresAt =
+//         new Date(
+//           Date.now() +
+//           8 * 60 * 60 * 1000
+//         );
+
+
+//       /* ------------------------------------------------------------
+//          INSERT USER SESSION
+//       ------------------------------------------------------------ */
+
+//       await pool.query(
+//         `
+//         INSERT INTO user_sessions
+//         (
+//           user_id,
+//           session_id,
+//           is_active,
+//           created_at,
+//           last_activity,
+//           expires_at,
+//           device_type,
+//           location,
+//           ip_address
+//         )
+
+//         VALUES
+//         (
+//           $1,
+//           $2,
+//           TRUE,
+//           CURRENT_TIMESTAMP,
+//           CURRENT_TIMESTAMP,
+//           $3,
+//           $4,
+//           $5,
+//           $6
+//         )
+//         `,
+//         [
+//           userId,
+//           sessionId,
+//           sessionExpiresAt,
+//           deviceType,
+//           location,
+//           ipAddress
+//         ]
+//       );
+
+
+//       /* ------------------------------------------------------------
+//          CREATE JWT
+         
+//          IMPORTANT:
+//          Use session_id, NOT sessionId.
+         
+//          authMiddleware reads:
+         
+//              decoded.session_id
+//       ------------------------------------------------------------ */
+
+//       const role =
+//         record.roleName
+//           .trim()
+//           .toUpperCase();
+
+
+//       const token =
+//         jwt.sign(
+//           {
+//             id:
+//               Number(userId),
+
+//             email:
+//               record.email_id,
+
+//             role:
+//               role === 'REVIEWER'
+//                 ? 'MANAGER'
+//                 : role,
+
+//             session_id:
+//               sessionId
+
+//           },
+
+//           JWT_SECRET,
+
+//           {
+//             expiresIn: '8h'
+//           }
+//         );
+
+
+//       /* ------------------------------------------------------------
+//          RESPONSE
+//       ------------------------------------------------------------ */
+
+//       res.json({
+
+//         success: true,
+
+//         userId,
+
+//         userName:
+//           record.user_name,
+
+//         emailId:
+//           record.email_id,
+
+//         phoneNumber:
+//           record.phone_number,
+
+//         roleName:
+//           record.roleName,
+
+//         featureAllowed:
+//           record.featureAllowed,
+
+//         token
+
+//       });
+
+
+//     } catch (err) {
+
+//       console.error(
+//         'OTP verify error:',
+//         err.message
+//       );
+
+//       res.status(500).json({
+//         error:
+//           err.message
+//       });
+
+//     }
+
+//   }
+// );
 
 
 /* ================================================================
