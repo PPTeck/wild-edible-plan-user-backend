@@ -22,8 +22,11 @@ const SELECT = `
     longitude,
     uploaded_by         AS "uploadedBy",
     verified_status       AS "verifiedStatus",
-    created_date        AS "createdDate"
+    created_date        AS "createdDate",
+    version,
+    deleted_at          AS "deletedAt"
   FROM plant_table
+  WHERE deleted_at IS NULL
 `;
 
 // GET /api/plants/all
@@ -40,7 +43,7 @@ router.get('/all', async (_req, res) => {
 // GET /api/plants/:id
 router.get('/:id', async (req, res) => {
   try {
-    const { rows } = await pool.query(SELECT + ' WHERE plant_id = $1', [req.params.id]);
+    const { rows } = await pool.query(SELECT + ' AND plant_id = $1', [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: 'Plant not found' });
     res.json({ data: encrypt(JSON.stringify(rows[0])) });
   } catch (err) {
@@ -84,7 +87,7 @@ router.put('/:id', async (req, res) => {
         distribution=$5, edible_parts=$6, nutritional_value=$7,
         flowering_season=$8, conservation_status=$9, image_url=$10,
         latitude=$11, longitude=$12, verified_status=$13
-      WHERE plant_id=$14
+      WHERE plant_id=$14 AND deleted_at IS NULL
     `, [scientificName, commonName, family, habitat, distribution, edibleParts,
         nutritionalValue, floweringSeason, conservationStatus, imageUrl,
         latitude, longitude, verifiedStatus, req.params.id]);

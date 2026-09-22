@@ -531,6 +531,7 @@ const searchFieldUserPlantsByCommonName = async (req, res) => {
             FROM plant_table
             WHERE LOWER(common_name) = LOWER($1)
             AND verified_status = true
+            AND deleted_at IS NULL
             ORDER BY plant_id DESC
             `,
             [common_name.trim()]
