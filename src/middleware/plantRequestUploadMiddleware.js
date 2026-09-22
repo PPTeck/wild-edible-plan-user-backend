@@ -1,13 +1,8 @@
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
-
-const uploadDir = path.join(
-    __dirname,
-    "..",
-    "uploads",
-    "plant-requests"
-);
+const uploadDir =
+    "/home/pteck/Downloads/wildplant/wild-edible-plan-user-backend/uploads/plant-requests";
 
 // Create directory if it doesn't exist
 if (!fs.existsSync(uploadDir)) {

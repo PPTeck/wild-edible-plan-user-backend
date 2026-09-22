@@ -109,7 +109,7 @@ const createFieldUserPlant = async (req, res) => {
         // =====================================================
         // USER ID FROM JWT
         // =====================================================
-
+ 
         const uploadedBy = req.user.id;
 
 
