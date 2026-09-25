@@ -13,9 +13,7 @@ const upload = multer({ storage, limits: { fileSize: 20 * 1024 * 1024 } });
 // POST /api/identify/
 router.post('/', upload.single('image'), async (req, res) => {
   try {
-    const { rows } = await pool.query(
-      'SELECT * FROM plant_table WHERE deleted_at IS NULL ORDER BY plant_id',
-    );
+    const { rows } = await pool.query('SELECT * FROM plant_table ORDER BY plant_id');
     const rng = Math.random;
     const results = rows
       .map(p => ({

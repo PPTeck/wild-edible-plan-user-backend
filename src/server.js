@@ -30,7 +30,6 @@ app.use('/api/identify',     require('./routes/identify'));
 app.use('/api/roles',        require('./routes/roles'));
 app.use('/api/users',        require('./routes/users'));
 app.use('/api/auth',         require('./routes/auth'));
-app.use('/api/field-user', require('./routes/fielduserplantroutes'));
 
 // Health check
 app.get('/api/health', (_req, res) => res.json({ status: 'ok', ts: new Date() }));
