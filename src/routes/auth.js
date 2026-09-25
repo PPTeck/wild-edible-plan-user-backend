@@ -327,6 +327,22 @@ router.post(
           .trim()
           .toLowerCase() === 'admin';
 
+      if (!isAdminLogin) {
+        const blockedResult = await pool.query(
+          `SELECT user_id
+           FROM blocked_users
+           WHERE LOWER(email_id) = LOWER($1)
+           LIMIT 1`,
+          [normalizedEmail]
+        );
+
+        if (blockedResult.rows.length > 0) {
+          return res.status(403).json({
+            error: 'account_blocked'
+          });
+        }
+      }
+
 
       /* ------------------------------------------------------------
          LOGIN ATTEMPT LOCKOUT
@@ -578,6 +594,20 @@ router.post(
           !isAdminLogin &&
           attempts >= MAX_LOGIN_ATTEMPTS
         ) {
+
+          await pool.query(
+            `INSERT INTO blocked_users
+              (user_id, user_name, email_id, blocked_at)
+             SELECT $1, $2, $3, CURRENT_TIMESTAMP
+             WHERE NOT EXISTS (
+               SELECT 1 FROM blocked_users WHERE user_id = $1
+             )`,
+            [
+              user.user_id,
+              user.user_name,
+              user.email_id
+            ]
+          );
 
           const oldestResult =
             await pool.query(
