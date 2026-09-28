@@ -16,6 +16,8 @@ const nodemailer = require('nodemailer');
 const pool       = require('../db');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'local-development-jwt-secret';
+const MAX_LOGIN_ATTEMPTS = 3;
+const LOCKOUT_HOURS = 1;
 
 // ── AWS SES SMTP transporter ───────────────────────────────
 const transporter = nodemailer.createTransport({
@@ -35,6 +37,80 @@ const emailConfigured = !!(process.env.SMTP_HOST && process.env.SMTP_USER
 // ── Helper: 6-digit OTP ───────────────────────────────────
 function generateOTP() {
   return Math.floor(100000 + Math.random() * 900000).toString();
+}
+
+async function getRecentFailedAttempts(email) {
+  const { rows } = await pool.query(
+    `SELECT COUNT(*)::int AS count
+     FROM login_attempts
+     WHERE email = $1
+       AND success = FALSE
+       AND attempted_at > NOW() - INTERVAL '1 hour'`,
+    [email]
+  );
+  return rows[0].count;
+}
+
+async function getLockoutDetails(email) {
+  const { rows } = await pool.query(
+    `SELECT attempted_at
+     FROM login_attempts
+     WHERE email = $1
+       AND success = FALSE
+       AND attempted_at > NOW() - INTERVAL '1 hour'
+     ORDER BY attempted_at ASC
+     LIMIT 1`,
+    [email]
+  );
+
+  if (!rows.length) return null;
+
+  const lockedUntil = new Date(
+    new Date(rows[0].attempted_at).getTime() + LOCKOUT_HOURS * 60 * 60 * 1000
+  );
+
+  return {
+    lockedUntil: lockedUntil.toISOString(),
+    minutesLeft: Math.max(1, Math.ceil((lockedUntil.getTime() - Date.now()) / 60000)),
+  };
+}
+
+async function recordFailedLogin(email, user, ipAddress) {
+  await pool.query(
+    `INSERT INTO login_attempts (email, success, ip_address)
+     VALUES ($1, FALSE, $2)`,
+    [email, ipAddress ?? null]
+  );
+
+  const failedAttempts = await getRecentFailedAttempts(email);
+  if (failedAttempts < MAX_LOGIN_ATTEMPTS) {
+    return { failedAttempts, locked: false };
+  }
+
+  // Keep the block record for audit/admin screens. Login enforcement uses
+  // blocked_at so the automatic block expires after one hour.
+  const updatedBlock = await pool.query(
+    `UPDATE blocked_users
+     SET blocked_at = CURRENT_TIMESTAMP,
+         user_name = $2,
+         email_id = $3
+     WHERE user_id = $1`,
+    [user.user_id, user.user_name, user.email_id]
+  );
+
+  if (updatedBlock.rowCount === 0) {
+    await pool.query(
+      `INSERT INTO blocked_users (user_id, user_name, email_id, blocked_at)
+       VALUES ($1, $2, $3, CURRENT_TIMESTAMP)`,
+      [user.user_id, user.user_name, user.email_id]
+    );
+  }
+
+  return {
+    failedAttempts,
+    locked: true,
+    ...(await getLockoutDetails(email)),
+  };
 }
 
 // ── Helper: send OTP email via AWS SES ────────────────────
@@ -93,6 +169,8 @@ router.post('/login', async (req, res) => {
   }
 
   try {
+    const normalizedEmail = emailId.trim().toLowerCase();
+
     // Find user by email + role
     const { rows } = await pool.query(`
       SELECT u.user_id, u.user_name, u.phone_number, u.email_id,
@@ -103,13 +181,46 @@ router.post('/login', async (req, res) => {
       JOIN role_table r ON u.role_id = r.role_id
       WHERE LOWER(u.email_id) = LOWER($1)
         AND TRIM(r.role_name) = $2
-    `, [emailId.trim(), roleName]);
+    `, [normalizedEmail, roleName.trim()]);
 
     if (!rows.length) {
       return res.status(401).json({ error: 'Invalid email or role. Please check and try again.' });
     }
 
     const user = rows[0];
+    const isAdmin = user.roleName.trim().toLowerCase() === 'admin';
+
+    if (!isAdmin) {
+      const { rows: blockedRows } = await pool.query(
+        `SELECT blocked_at
+         FROM blocked_users
+         WHERE user_id = $1
+           AND blocked_at > NOW() - INTERVAL '1 hour'
+         LIMIT 1`,
+        [user.user_id]
+      );
+
+      if (blockedRows.length) {
+        const lockedUntil = new Date(
+          new Date(blockedRows[0].blocked_at).getTime() + LOCKOUT_HOURS * 60 * 60 * 1000
+        );
+        return res.status(429).json({
+          error: 'account_locked',
+          userName: user.user_name,
+          lockedUntil: lockedUntil.toISOString(),
+          minutesLeft: Math.max(1, Math.ceil((lockedUntil.getTime() - Date.now()) / 60000)),
+        });
+      }
+
+      if (await getRecentFailedAttempts(normalizedEmail) >= MAX_LOGIN_ATTEMPTS) {
+        const lockout = await getLockoutDetails(normalizedEmail);
+        return res.status(429).json({
+          error: 'account_locked',
+          userName: user.user_name,
+          ...lockout,
+        });
+      }
+    }
 
     // Verify password — support test seed 'HASHED_PASSWORD'
     const isValid = user.password_hash === 'HASHED_PASSWORD'
@@ -117,6 +228,18 @@ router.post('/login', async (req, res) => {
       : await bcrypt.compare(password, user.password_hash);
 
     if (!isValid) {
+      if (!isAdmin) {
+        const lockout = await recordFailedLogin(normalizedEmail, user, req.ip);
+        if (lockout.locked) {
+          return res.status(429).json({
+            error: 'account_locked',
+            userName: user.user_name,
+            lockedUntil: lockout.lockedUntil,
+            minutesLeft: lockout.minutesLeft,
+          });
+        }
+      }
+
       return res.status(401).json({ error: 'Incorrect password' });
     }
 
