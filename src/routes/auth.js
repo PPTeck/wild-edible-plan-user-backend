@@ -458,16 +458,38 @@ router.post('/logout', async (req, res) => {
   const { token } = req.body;
   if (!token) return res.json({ success: true });
 
+  let decoded;
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
+    decoded = jwt.verify(token, JWT_SECRET);
+  } catch (err) {
+    console.error('Logout token verification error:', err.message);
+    return res.status(401).json({ success: false, error: 'Invalid or expired token' });
+  }
+
+  const sessionId = decoded.sessionId || decoded.session_id;
+  if (!sessionId || !decoded.id) {
+    return res.status(400).json({ success: false, error: 'Session information is missing from token' });
+  }
+
+  try {
+    await pool.query(
+      `UPDATE user_sessions
+       SET is_active = FALSE,
+           invalidated_at = COALESCE(invalidated_at, CURRENT_TIMESTAMP),
+           invalidation_reason = 'user_logout'
+       WHERE session_id = $1
+         AND user_id = $2`,
+      [sessionId, decoded.id]
+    );
     // Clear session token from DB
     await pool.query(
       `UPDATE user_table SET session_token = NULL WHERE user_id = $1`,
       [decoded.id]
     );
     res.json({ success: true });
-  } catch {
-    res.json({ success: true }); // Always succeed on logout
+  } catch (err) {
+    console.error('Logout error:', err.message);
+    res.status(500).json({ success: false, error: 'Unable to log out' });
   }
 });
 
