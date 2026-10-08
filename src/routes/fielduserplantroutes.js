@@ -12,9 +12,21 @@ const {
     createFieldUserPlant,
     getFieldUserPlantById,
     searchFieldUserPlantsByScientificName,
-    searchFieldUserPlantsByCommonName
+    searchFieldUserPlantsByCommonName,
+    getApprovedPlantsInArea,
+    getAllPlants
 } = require("../controllers/fielduserplantcontroller");
 
+
+// ============================================================
+// FIELD USER - GET FULL PLANT LIST
+// ============================================================
+
+router.get(
+    "/plants/all",
+    authenticateToken,
+    getAllPlants
+);
 
 // ============================================================
 // FIELD USER - SUBMIT PLANT
@@ -58,6 +70,12 @@ router.get(
     "/plants/:id",
     authenticateToken,
     getFieldUserPlantById
+);
+
+router.get(
+    "/approved-plants-in-area",
+    authenticateToken,
+    getApprovedPlantsInArea
 );
 
 

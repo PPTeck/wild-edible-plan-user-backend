@@ -189,6 +189,7 @@ const createFieldUserPlant = async (req, res) => {
         // =====================================================
         // SUCCESS
         // =====================================================
+        console.log("app data",plantData);
 
         return res.status(201).json({
 
@@ -555,10 +556,210 @@ const searchFieldUserPlantsByCommonName = async (req, res) => {
         });
     }
 };
+
+// ============================================================
+// FIELD USER - GET APPROVED PLANTS IN MAP AREA
+// ============================================================
+
+const getApprovedPlantsInArea = async (req, res) => {
+    try {
+
+        const {
+            minLat,
+            maxLat,
+            minLng,
+            maxLng
+        } = req.query;
+
+        // ----------------------------------------------------
+        // VALIDATE REQUIRED PARAMETERS
+        // ----------------------------------------------------
+
+        if (
+            minLat === undefined ||
+            maxLat === undefined ||
+            minLng === undefined ||
+            maxLng === undefined
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: "minLat, maxLat, minLng and maxLng are required"
+            });
+        }
+
+        // ----------------------------------------------------
+        // CONVERT TO NUMBERS
+        // ----------------------------------------------------
+
+        const minLatitude = Number(minLat);
+        const maxLatitude = Number(maxLat);
+        const minLongitude = Number(minLng);
+        const maxLongitude = Number(maxLng);
+
+        // ----------------------------------------------------
+        // VALIDATE COORDINATES
+        // ----------------------------------------------------
+
+        if (
+            !Number.isFinite(minLatitude) ||
+            !Number.isFinite(maxLatitude) ||
+            !Number.isFinite(minLongitude) ||
+            !Number.isFinite(maxLongitude)
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: "Latitude and longitude must be valid numbers"
+            });
+        }
+
+        if (
+            minLatitude < -90 ||
+            maxLatitude > 90 ||
+            minLongitude < -180 ||
+            maxLongitude > 180
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid latitude or longitude range"
+            });
+        }
+
+        if (
+            minLatitude > maxLatitude ||
+            minLongitude > maxLongitude
+        ) {
+            return res.status(400).json({
+                success: false,
+                message: "Minimum coordinates cannot be greater than maximum coordinates"
+            });
+        }
+
+        // ----------------------------------------------------
+        // GET APPROVED PLANTS INSIDE MAP AREA
+        // ----------------------------------------------------
+
+        const result = await pool.query(
+            `
+            SELECT
+                plant_id,
+                image_id,
+                scientific_name,
+                common_name,
+                family,
+                habitat,
+                distribution,
+                edible_parts,
+                nutritional_value,
+                flowering_season,
+                conservation_status,
+                image_url,
+                latitude,
+                longitude,
+                uploaded_by,
+                verified_status,
+                created_date,
+                image_mime_type
+            FROM plant_table
+            WHERE verified_status = true
+              AND deleted_at IS NULL
+              AND latitude IS NOT NULL
+              AND longitude IS NOT NULL
+              AND latitude BETWEEN $1 AND $2
+              AND longitude BETWEEN $3 AND $4
+            ORDER BY plant_id DESC
+            `,
+            [
+                minLatitude,
+                maxLatitude,
+                minLongitude,
+                maxLongitude
+            ]
+        );
+
+        // ----------------------------------------------------
+        // RESPONSE
+        // ----------------------------------------------------
+
+        return res.status(200).json({
+            success: true,
+            count: result.rows.length,
+            plants: result.rows
+        });
+
+    } catch (error) {
+
+        console.error(
+            "GET APPROVED PLANTS IN AREA ERROR:",
+            error
+        );
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to fetch approved plants in area"
+        });
+    }
+};
+
+// ============================================================
+// FIELD USER - GET FULL PLANT LIST
+// ============================================================
+
+const getAllPlants = async (req, res) => {
+    try {
+
+        const result = await pool.query(`
+            SELECT
+                plant_id,
+                image_id,
+                scientific_name,
+                common_name,
+                family,
+                habitat,
+                distribution,
+                edible_parts,
+                nutritional_value,
+                flowering_season,
+                conservation_status,
+                image_url,
+                latitude,
+                longitude,
+                uploaded_by,
+                verified_status,
+                created_date,
+                image_mime_type
+            FROM plant_table
+            WHERE verified_status = true
+              AND deleted_at IS NULL
+            ORDER BY plant_id DESC
+        `);
+
+        return res.status(200).json({
+            success: true,
+            count: result.rows.length,
+            plants: result.rows
+        });
+
+    } catch (error) {
+
+        console.error(
+            "GET ALL PLANTS ERROR:",
+            error
+        );
+
+        return res.status(500).json({
+            success: false,
+            message: "Failed to fetch full plant list"
+        });
+    }
+};
+
+
 module.exports = {
     createFieldUserPlant,
     getFieldUserPlants,
     getFieldUserPlantById,
     searchFieldUserPlantsByScientificName,
-    searchFieldUserPlantsByCommonName
+    searchFieldUserPlantsByCommonName,
+    getApprovedPlantsInArea,
+    getAllPlants
 };
