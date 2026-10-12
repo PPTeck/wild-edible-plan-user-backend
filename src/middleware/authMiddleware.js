@@ -1,5 +1,6 @@
 const jwt  = require("jsonwebtoken");
 const pool = require("../db");
+const JWT_SECRET = process.env.JWT_SECRET || "local-development-jwt-secret";
 
 const authenticateToken = async (req, res, next) => {
 
@@ -25,22 +26,23 @@ const authenticateToken = async (req, res, next) => {
 
         const token = parts[1];
 
-        const decoded = jwt.verify(
-            token,
-            process.env.JWT_SECRET
-        );
+        const decoded = jwt.verify(token, JWT_SECRET);
 
         // --------------------------------------------------------
         // VALIDATE SESSION IS STILL ACTIVE IN user_sessions TABLE
         // --------------------------------------------------------
 
-        if (decoded.session_id) {
+        // Tokens issued by auth.js use `sessionId`; accept the legacy
+        // snake_case claim as well.
+        const sessionId = decoded.sessionId || decoded.session_id;
+
+        if (sessionId) {
 
             const sessionResult = await pool.query(
                 `SELECT is_active
                  FROM   user_sessions
                  WHERE  session_id = $1`,
-                [decoded.session_id]
+                [sessionId]
             );
 
             if (
@@ -57,7 +59,7 @@ const authenticateToken = async (req, res, next) => {
                 `UPDATE user_sessions
                  SET    last_activity = CURRENT_TIMESTAMP
                  WHERE  session_id = $1`,
-                [decoded.session_id]
+                [sessionId]
             );
 
         }
